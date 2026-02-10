@@ -78,7 +78,17 @@ class TelemetryCreate(BaseModel):
     power: float = 0
     isCharging: bool = False
     cycleCount: int = 0
-    usedCapacity: float = 0  # Ah - used by ML models
+    usedCapacity: float = 0
+    # Charging values
+    chargingVoltage: float = 0
+    chargingCurrent: float = 0
+    chargingTemp: float = 0
+    chargingPower: float = 0
+    # Discharging values
+    dischargingVoltage: float = 0
+    dischargingCurrent: float = 0
+    dischargingTemp: float = 0
+    dischargingPower: float = 0
 
 class TelemetryResponse(BaseModel):
     id: int
@@ -92,6 +102,14 @@ class TelemetryResponse(BaseModel):
     isCharging: bool
     cycleCount: int
     usedCapacity: float
+    chargingVoltage: float
+    chargingCurrent: float
+    chargingTemp: float
+    chargingPower: float
+    dischargingVoltage: float
+    dischargingCurrent: float
+    dischargingTemp: float
+    dischargingPower: float
     timestamp: datetime
 
     class Config:
@@ -270,7 +288,15 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
         power=data.power,
         is_charging=data.isCharging,
         cycle_count=data.cycleCount,
-        used_capacity=data.usedCapacity
+        used_capacity=data.usedCapacity,
+        charging_voltage=data.chargingVoltage,
+        charging_current=data.chargingCurrent,
+        charging_temp=data.chargingTemp,
+        charging_power=data.chargingPower,
+        discharging_voltage=data.dischargingVoltage,
+        discharging_current=data.dischargingCurrent,
+        discharging_temp=data.dischargingTemp,
+        discharging_power=data.dischargingPower
     )
     db.add(telemetry)
     db.commit()
@@ -339,6 +365,14 @@ def get_telemetry(vehicle_id: str, db: Session = Depends(get_db)):
         "isCharging": telemetry.is_charging,
         "cycleCount": telemetry.cycle_count,
         "usedCapacity": telemetry.used_capacity,
+        "chargingVoltage": telemetry.charging_voltage,
+        "chargingCurrent": telemetry.charging_current,
+        "chargingTemp": telemetry.charging_temp,
+        "chargingPower": telemetry.charging_power,
+        "dischargingVoltage": telemetry.discharging_voltage,
+        "dischargingCurrent": telemetry.discharging_current,
+        "dischargingTemp": telemetry.discharging_temp,
+        "dischargingPower": telemetry.discharging_power,
         "timestamp": telemetry.timestamp.isoformat()
     }
 
@@ -361,6 +395,15 @@ def get_telemetry_history(vehicle_id: str, limit: int = 100, db: Session = Depen
         "internalResistance": r.internal_resistance,
         "usedCapacity": r.used_capacity,
         "cycleCount": r.cycle_count,
+        "isCharging": r.is_charging,
+        "chargingVoltage": r.charging_voltage,
+        "chargingCurrent": r.charging_current,
+        "chargingTemp": r.charging_temp,
+        "chargingPower": r.charging_power,
+        "dischargingVoltage": r.discharging_voltage,
+        "dischargingCurrent": r.discharging_current,
+        "dischargingTemp": r.discharging_temp,
+        "dischargingPower": r.discharging_power,
         "timestamp": r.timestamp.isoformat()
     } for r in reversed(records)]
 

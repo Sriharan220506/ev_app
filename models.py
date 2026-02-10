@@ -38,6 +38,7 @@ class Telemetry(Base):
     power = Column(Float, default=0)
     is_charging = Column(Boolean, default=False)
     cycle_count = Column(Integer, default=0)
+    used_capacity = Column(Float, default=0)  # Ah - for ML model input
     
     # Timestamp
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)

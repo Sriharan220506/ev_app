@@ -53,8 +53,8 @@ def load_models():
     global soh_model, rul_model, bct_model, feature_scaler
     
     model_files = {
-        "soh": "soh_model_xgboost.pkl",
-        "rul": "rul_model_xgboost.pkl",
+        "soh": "soh_model.pkl",
+        "rul": "rul_model.pkl",
         "bct": "bct_model.pkl",
         "scaler": "feature_scaler.pkl",
     }
@@ -322,14 +322,16 @@ def calculate_eul(cycle_count, voltage=None):
         return min(100, (1 - health) * 100)
     return min(100, (cycle_count / MAX_CYCLES) * 100)
 
+
+    
 def detect_battery_condition(voltage, soc, internal_resistance, cycle_count, used_capacity):
-    """Detect if the connected battery is NEW or OLD based on sensor values"""
+    """Detect if the connected battery is NEW or OLD based on sensor values (3.88V base)"""
     score = 0
     
-    # High voltage = new battery (>= 3.9V for li-ion 3.7V cell)
-    if voltage >= 3.9:
+    # High voltage = new battery (>= 3.80V for 100% SOH at 3.88V)
+    if voltage >= 3.80:
         score += 25
-    elif voltage >= 3.6:
+    elif voltage >= 3.40:
         score += 15
     else:
         score += 5
@@ -351,9 +353,9 @@ def detect_battery_condition(voltage, soc, internal_resistance, cycle_count, use
         score += 5
     
     # Low used capacity = new battery
-    if used_capacity < 0.5:
+    if used_capacity < 0.2:
         score += 25
-    elif used_capacity < 5:
+    elif used_capacity < 2.0:
         score += 15
     else:
         score += 5
@@ -452,6 +454,11 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
     if not vehicle:
         vehicle = Vehicle(id=data.vehicleId, name=f"Vehicle {data.vehicleId}")
         db.add(vehicle)
+    
+    # FORCE SOC CALCULATION based on voltage (3.88V=100%, 2.0V=0%)
+    # This ensures "charging increasing" works in the dashboard
+    v_soc = max(0, min(100, (data.voltage - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE) * 100))
+    data.soc = v_soc
     
     # Create telemetry record
     telemetry = Telemetry(

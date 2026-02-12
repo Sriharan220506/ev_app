@@ -36,32 +36,45 @@ app.add_middleware(
 )
 
 # ============== Load ML Models ==============
+# Models trained on 7 features: [cycle, chI, chV, chT, disI, disV, disT]
+# SOH → GradientBoosting (R²=0.9997)
+# RUL → RandomForest (R²=0.9055)
+# BCT → GradientBoosting (R²=0.9997)
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models_ml")
 
 soh_model = None
 rul_model = None
+bct_model = None
+feature_scaler = None
 
 def load_models():
-    """Load XGBoost models at startup"""
-    global soh_model, rul_model
+    """Load trained ML models and scaler at startup"""
+    global soh_model, rul_model, bct_model, feature_scaler
     
-    soh_path = os.path.join(MODEL_DIR, "soh_model_xgboost.pkl")
-    rul_path = os.path.join(MODEL_DIR, "rul_model_xgboost.pkl")
+    model_files = {
+        "soh": "soh_model_xgboost.pkl",
+        "rul": "rul_model_xgboost.pkl",
+        "bct": "bct_model.pkl",
+        "scaler": "feature_scaler.pkl",
+    }
     
-    try:
-        with open(soh_path, "rb") as f:
-            soh_model = pickle.load(f)
-        print(f"✅ SOH model loaded ({soh_model.n_features_in_} features)")
-    except Exception as e:
-        print(f"⚠️ SOH model not found: {e}")
-    
-    try:
-        with open(rul_path, "rb") as f:
-            rul_model = pickle.load(f)
-        print(f"✅ RUL model loaded ({rul_model.n_features_in_} features)")
-    except Exception as e:
-        print(f"⚠️ RUL model not found: {e}")
+    for key, filename in model_files.items():
+        path = os.path.join(MODEL_DIR, filename)
+        try:
+            with open(path, "rb") as f:
+                obj = pickle.load(f)
+            if key == "soh":
+                soh_model = obj
+            elif key == "rul":
+                rul_model = obj
+            elif key == "bct":
+                bct_model = obj
+            elif key == "scaler":
+                feature_scaler = obj
+            print(f"Loaded {key}: {filename}")
+        except Exception as e:
+            print(f"Warning: {key} model not found: {e}")
 
 # Load models immediately
 load_models()
@@ -142,55 +155,66 @@ THRESHOLDS = {
 }
 
 # ============== ML Prediction Functions ==============
+# Features order: [cycle, chI, chV, chT, disI, disV, disT]
 
-def predict_soh_ml(voltage, current, power, temperature, soc, cycle_count, internal_resistance, used_capacity):
-    """Predict SOH using XGBoost model"""
+def build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
+    """Build the 7-feature array matching dataset training order"""
+    raw = np.array([[cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp]])
+    if feature_scaler is not None:
+        return feature_scaler.transform(raw)
+    return raw
+
+def predict_soh_ml(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
+    """Predict SOH using GradientBoosting model (R²=0.9997)"""
     if soh_model is None:
-        return predict_soh_fallback(internal_resistance, cycle_count, temperature)
-    
+        return predict_soh_fallback(ch_voltage, cycle, ch_temp)
     try:
-        # Use abs(current) and abs(power) — ML model was trained on magnitudes, not signed values
-        features = np.array([[
-            voltage, abs(current), abs(power), temperature,
-            soc, cycle_count, internal_resistance, used_capacity
-        ]])
+        features = build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp)
         prediction = soh_model.predict(features)[0]
         return float(max(0, min(100, prediction)))
     except Exception as e:
         print(f"SOH ML error: {e}")
-        return predict_soh_fallback(internal_resistance, cycle_count, temperature)
+        return predict_soh_fallback(ch_voltage, cycle, ch_temp)
 
-def predict_rul_ml(voltage, current, power, temperature, soc, cycle_count, internal_resistance, used_capacity):
-    """Predict RUL using XGBoost model"""
+def predict_rul_ml(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
+    """Predict RUL using RandomForest model (R²=0.9055)"""
     if rul_model is None:
-        return predict_rul_fallback(100, cycle_count)
-    
+        return predict_rul_fallback(100, cycle)
     try:
-        features = np.array([[
-            voltage, abs(current), abs(power), temperature,
-            soc, cycle_count, internal_resistance, used_capacity
-        ]])
+        features = build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp)
         prediction = rul_model.predict(features)[0]
         remaining_cycles = int(max(0, prediction))
         months = int(remaining_cycles / 30)
         return {"cycles": remaining_cycles, "months": months}
     except Exception as e:
         print(f"RUL ML error: {e}")
-        return predict_rul_fallback(100, cycle_count)
+        return predict_rul_fallback(100, cycle)
+
+def predict_bct_ml(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
+    """Predict Battery Condition (BCT) using GradientBoosting model (R²=0.9997)"""
+    if bct_model is None:
+        return 1.0  # default mid-range
+    try:
+        features = build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp)
+        prediction = bct_model.predict(features)[0]
+        return float(max(0, prediction))
+    except Exception as e:
+        print(f"BCT ML error: {e}")
+        return 1.0
 
 # ============== Fallback Predictions ==============
 
-def predict_soh_fallback(internal_resistance, cycle_count, temperature):
+def predict_soh_fallback(voltage, cycle_count, temperature):
     """Rule-based SOH fallback"""
-    resistance_factor = max(0, 100 - (internal_resistance - 30) * 0.5)
-    cycle_factor = max(0, 100 - (cycle_count * 0.02))
+    voltage_factor = min(100, max(0, (voltage - 3.0) / 1.2 * 100))
+    cycle_factor = max(0, 100 - (cycle_count * 0.2))
     temp_factor = 100 if 15 <= temperature <= 35 else 90
-    soh = (resistance_factor * 0.4 + cycle_factor * 0.4 + temp_factor * 0.2)
+    soh = (voltage_factor * 0.3 + cycle_factor * 0.5 + temp_factor * 0.2)
     return max(0, min(100, soh))
 
 def predict_rul_fallback(soh, cycle_count):
     """Rule-based RUL fallback"""
-    max_cycles = 2500
+    max_cycles = 250
     remaining_cycles = int((soh / 100) * max_cycles - cycle_count)
     remaining_cycles = max(0, remaining_cycles)
     months = int(remaining_cycles / 30)
@@ -198,7 +222,7 @@ def predict_rul_fallback(soh, cycle_count):
 
 def calculate_eul(cycle_count):
     """Calculate Estimated Used Life percentage"""
-    max_cycles = 2500
+    max_cycles = 250
     return min(100, (cycle_count / max_cycles) * 100)
 
 def detect_battery_condition(voltage, soc, internal_resistance, cycle_count, used_capacity):
@@ -360,59 +384,26 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
     # Check for alerts
     check_alerts(telemetry, db)
     
-    # ========== PRINT ARDUINO INPUTS ==========
-    print("\n" + "=" * 60)
-    print("📡 TELEMETRY RECEIVED FROM ARDUINO")
-    print("=" * 60)
-    print(f"  Vehicle:           {data.vehicleId}")
-    print(f"  Voltage:           {data.voltage:.3f} V")
-    print(f"  Current:           {data.current:.4f} A  ({data.current * 1000:.1f} mA)")
-    print(f"  Power:             {data.power:.4f} W  ({data.power * 1000:.1f} mW)")
-    print(f"  Temperature:       {data.temperature:.1f} °C")
-    print(f"  SOC:               {data.soc:.1f} %")
-    print(f"  Is Charging:       {data.isCharging}")
-    print(f"  Cycle Count:       {data.cycleCount}")
-    print(f"  Internal Resist:   {data.internalResistance:.2f} mΩ")
-    print(f"  Used Capacity:     {data.usedCapacity:.4f} Ah")
-    print(f"  --- Charging Values ---")
-    print(f"  Chg Voltage:       {data.chargingVoltage:.3f} V")
-    print(f"  Chg Current:       {data.chargingCurrent:.4f} A")
-    print(f"  Chg Temp:          {data.chargingTemp:.1f} °C")
-    print(f"  Chg Power:         {data.chargingPower:.4f} W")
-    print(f"  --- Discharging Values ---")
-    print(f"  Dis Voltage:       {data.dischargingVoltage:.3f} V")
-    print(f"  Dis Current:       {data.dischargingCurrent:.4f} A")
-    print(f"  Dis Temp:          {data.dischargingTemp:.1f} °C")
-    print(f"  Dis Power:         {data.dischargingPower:.4f} W")
-    
-    # ========== ML PREDICTIONS ==========
-    ml_features = [
-        data.voltage, abs(data.current), abs(data.power), data.temperature,
-        data.soc, data.cycleCount, data.internalResistance, data.usedCapacity
-    ]
-    print(f"\n🧠 ML INPUT FEATURES (8 values):")
-    print(f"  [voltage, |current|, |power|, temp, soc, cycles, resistance, usedCap]")
-    print(f"  {ml_features}")
-    
+    # ML Predictions using 7 features: [cycle, chI, chV, chT, disI, disV, disT]
     soh = predict_soh_ml(
-        data.voltage, data.current, data.power, data.temperature,
-        data.soc, data.cycleCount, data.internalResistance, data.usedCapacity
+        data.cycleCount,
+        data.chargingCurrent, data.chargingVoltage, data.chargingTemp,
+        data.dischargingCurrent, data.dischargingVoltage, data.dischargingTemp
     )
     rul = predict_rul_ml(
-        data.voltage, data.current, data.power, data.temperature,
-        data.soc, data.cycleCount, data.internalResistance, data.usedCapacity
+        data.cycleCount,
+        data.chargingCurrent, data.chargingVoltage, data.chargingTemp,
+        data.dischargingCurrent, data.dischargingVoltage, data.dischargingTemp
+    )
+    bct = predict_bct_ml(
+        data.cycleCount,
+        data.chargingCurrent, data.chargingVoltage, data.chargingTemp,
+        data.dischargingCurrent, data.dischargingVoltage, data.dischargingTemp
     )
     eul = calculate_eul(data.cycleCount)
     
-    model_type = "xgboost" if soh_model else "rule-based"
-    
-    print(f"\n📊 ML PREDICTION RESULTS ({model_type}):")
-    print(f"  SOH:               {soh:.2f} %")
-    print(f"  RUL:               {rul['cycles']} cycles  ({rul['months']} months)")
-    print(f"  EUL:               {eul:.2f} %")
-    print(f"  Trend:             {'declining' if soh < 85 else 'stable'}")
-    print(f"  Confidence:        {'0.92' if soh_model else '0.70'}")
-    print("=" * 60 + "\n")
+    model_type = "ml-trained" if soh_model else "rule-based"
+    confidence = 0.95 if soh_model else 0.70
     
     prediction = Prediction(
         vehicle_id=data.vehicleId,
@@ -421,7 +412,7 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
         rul_months=rul["months"],
         eul_percentage=eul,
         trend="declining" if soh < 85 else "stable",
-        confidence=0.92 if soh_model else 0.70
+        confidence=confidence
     )
     db.add(prediction)
     db.commit()
@@ -434,6 +425,7 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
             "soh": round(soh, 2),
             "rul_cycles": rul["cycles"],
             "rul_months": rul["months"],
+            "bct": round(bct, 4),
             "model": model_type
         }
     }
@@ -450,11 +442,18 @@ def get_telemetry(vehicle_id: str, db: Session = Depends(get_db)):
     if not telemetry:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     
-    # Detect battery condition
+    # Detect battery condition (rule-based)
     battery_condition = detect_battery_condition(
         telemetry.voltage, telemetry.soc,
         telemetry.internal_resistance, telemetry.cycle_count,
         telemetry.used_capacity
+    )
+    
+    # ML BCT prediction
+    bct = predict_bct_ml(
+        telemetry.cycle_count,
+        telemetry.charging_current or 0, telemetry.charging_voltage or 0, telemetry.charging_temp or 0,
+        telemetry.discharging_current or 0, telemetry.discharging_voltage or 0, telemetry.discharging_temp or 0
     )
     
     return {
@@ -477,6 +476,7 @@ def get_telemetry(vehicle_id: str, db: Session = Depends(get_db)):
         "dischargingTemp": telemetry.discharging_temp,
         "dischargingPower": telemetry.discharging_power,
         "batteryCondition": battery_condition,
+        "bct": round(bct, 4),
         "timestamp": telemetry.timestamp.isoformat()
     }
 

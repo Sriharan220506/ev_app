@@ -149,12 +149,12 @@ def predict_soh_ml(voltage, current, power, temperature, soc, cycle_count, inter
         return predict_soh_fallback(internal_resistance, cycle_count, temperature)
     
     try:
+        # Use abs(current) and abs(power) — ML model was trained on magnitudes, not signed values
         features = np.array([[
-            voltage, current, power, temperature,
+            voltage, abs(current), abs(power), temperature,
             soc, cycle_count, internal_resistance, used_capacity
         ]])
         prediction = soh_model.predict(features)[0]
-        # Clamp to valid range
         return float(max(0, min(100, prediction)))
     except Exception as e:
         print(f"SOH ML error: {e}")
@@ -167,7 +167,7 @@ def predict_rul_ml(voltage, current, power, temperature, soc, cycle_count, inter
     
     try:
         features = np.array([[
-            voltage, current, power, temperature,
+            voltage, abs(current), abs(power), temperature,
             soc, cycle_count, internal_resistance, used_capacity
         ]])
         prediction = rul_model.predict(features)[0]
@@ -201,15 +201,60 @@ def calculate_eul(cycle_count):
     max_cycles = 2500
     return min(100, (cycle_count / max_cycles) * 100)
 
+def detect_battery_condition(voltage, soc, internal_resistance, cycle_count, used_capacity):
+    """Detect if the connected battery is NEW or OLD based on sensor values"""
+    score = 0
+    
+    # High voltage = new battery (>= 3.9V for li-ion 3.7V cell)
+    if voltage >= 3.9:
+        score += 25
+    elif voltage >= 3.6:
+        score += 15
+    else:
+        score += 5
+    
+    # Low internal resistance = new battery (< 30 mΩ)
+    if internal_resistance < 30:
+        score += 25
+    elif internal_resistance < 50:
+        score += 15
+    else:
+        score += 0
+    
+    # Low cycle count = new battery
+    if cycle_count <= 5:
+        score += 25
+    elif cycle_count <= 50:
+        score += 15
+    else:
+        score += 5
+    
+    # Low used capacity = new battery
+    if used_capacity < 0.5:
+        score += 25
+    elif used_capacity < 5:
+        score += 15
+    else:
+        score += 5
+    
+    if score >= 80:
+        return {"condition": "NEW", "score": score, "detail": "Battery appears to be new or near-new"}
+    elif score >= 50:
+        return {"condition": "GOOD", "score": score, "detail": "Battery is in good used condition"}
+    elif score >= 30:
+        return {"condition": "AGED", "score": score, "detail": "Battery shows significant wear"}
+    else:
+        return {"condition": "OLD", "score": score, "detail": "Battery is heavily degraded"}
+
 def check_alerts(telemetry: Telemetry, db: Session):
-    """Check telemetry against thresholds and create alerts"""
+    """Check telemetry against thresholds and create alerts (with deduplication)"""
     alerts_to_create = []
     
     if telemetry.temperature > THRESHOLDS["max_temperature"]:
         alerts_to_create.append({
             "type": "critical",
             "title": "High Temperature Warning",
-            "message": f"Battery temperature ({telemetry.temperature}°C) exceeds safe limit",
+            "message": f"Battery temperature ({telemetry.temperature:.1f}°C) exceeds safe limit of {THRESHOLDS['max_temperature']}°C",
             "parameter": "temperature",
             "value": telemetry.temperature,
             "threshold": THRESHOLDS["max_temperature"]
@@ -219,7 +264,7 @@ def check_alerts(telemetry: Telemetry, db: Session):
         alerts_to_create.append({
             "type": "warning",
             "title": "Low Battery",
-            "message": f"Battery SOC ({telemetry.soc}%) is critically low",
+            "message": f"Battery SOC ({telemetry.soc:.1f}%) is below minimum {THRESHOLDS['min_soc']}%",
             "parameter": "soc",
             "value": telemetry.soc,
             "threshold": THRESHOLDS["min_soc"]
@@ -229,15 +274,25 @@ def check_alerts(telemetry: Telemetry, db: Session):
         alerts_to_create.append({
             "type": "warning",
             "title": "High Internal Resistance",
-            "message": f"Internal resistance ({telemetry.internal_resistance}mΩ) indicates degradation",
+            "message": f"Internal resistance ({telemetry.internal_resistance:.1f}mΩ) exceeds {THRESHOLDS['max_resistance']}mΩ",
             "parameter": "resistance",
             "value": telemetry.internal_resistance,
             "threshold": THRESHOLDS["max_resistance"]
         })
     
+    # Deduplication: don't create same alert type within 5 minutes
+    five_minutes_ago = datetime.utcnow() - timedelta(minutes=5)
+    
     for alert_data in alerts_to_create:
-        alert = Alert(vehicle_id=telemetry.vehicle_id, **alert_data)
-        db.add(alert)
+        existing = db.query(Alert).filter(
+            Alert.vehicle_id == telemetry.vehicle_id,
+            Alert.parameter == alert_data["parameter"],
+            Alert.timestamp > five_minutes_ago
+        ).first()
+        
+        if existing is None:
+            alert = Alert(vehicle_id=telemetry.vehicle_id, **alert_data)
+            db.add(alert)
     
     if alerts_to_create:
         db.commit()
@@ -354,6 +409,13 @@ def get_telemetry(vehicle_id: str, db: Session = Depends(get_db)):
     if not telemetry:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     
+    # Detect battery condition
+    battery_condition = detect_battery_condition(
+        telemetry.voltage, telemetry.soc,
+        telemetry.internal_resistance, telemetry.cycle_count,
+        telemetry.used_capacity
+    )
+    
     return {
         "vehicleId": telemetry.vehicle_id,
         "voltage": telemetry.voltage,
@@ -373,6 +435,7 @@ def get_telemetry(vehicle_id: str, db: Session = Depends(get_db)):
         "dischargingCurrent": telemetry.discharging_current,
         "dischargingTemp": telemetry.discharging_temp,
         "dischargingPower": telemetry.discharging_power,
+        "batteryCondition": battery_condition,
         "timestamp": telemetry.timestamp.isoformat()
     }
 
@@ -609,6 +672,38 @@ def list_vehicles(db: Session = Depends(get_db)):
         })
     
     return result
+
+# ---------- Reset Endpoint ----------
+
+@app.delete("/api/reset/{vehicle_id}")
+def reset_vehicle_data(vehicle_id: str, db: Session = Depends(get_db)):
+    """Reset all data for a vehicle — manual restart"""
+    
+    # Delete in order: alerts, predictions, telemetry
+    deleted_alerts = db.query(Alert).filter(Alert.vehicle_id == vehicle_id).delete()
+    deleted_predictions = db.query(Prediction).filter(Prediction.vehicle_id == vehicle_id).delete()
+    deleted_telemetry = db.query(Telemetry).filter(Telemetry.vehicle_id == vehicle_id).delete()
+    
+    db.commit()
+    
+    return {
+        "status": "ok",
+        "message": f"All data reset for {vehicle_id}",
+        "deleted": {
+            "telemetry": deleted_telemetry,
+            "predictions": deleted_predictions,
+            "alerts": deleted_alerts
+        }
+    }
+
+@app.delete("/api/alerts/{vehicle_id}/clear")
+def clear_vehicle_alerts(vehicle_id: str, db: Session = Depends(get_db)):
+    """Clear all alerts for a vehicle"""
+    
+    deleted = db.query(Alert).filter(Alert.vehicle_id == vehicle_id).delete()
+    db.commit()
+    
+    return {"status": "ok", "deleted": deleted}
 
 if __name__ == "__main__":
     import uvicorn

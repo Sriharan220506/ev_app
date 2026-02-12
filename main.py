@@ -36,10 +36,11 @@ app.add_middleware(
 )
 
 # ============== Load ML Models ==============
-# Models trained on 7 features: [cycle, chI, chV, chT, disI, disV, disT]
-# SOH → GradientBoosting (R²=0.9997)
-# RUL → RandomForest (R²=0.9055)
-# BCT → GradientBoosting (R²=0.9997)
+# Research paper-based models (Patrizi et al., 2024)
+# 12 features: cycle, chI, chV, chT, disI, disV, disT, IR, sqrt_cycle, cycle_sq, cap_residual, temp_diff
+# SOH → ExtraTrees (R²=0.9999)
+# RUL → RandomForest (R²=0.9995)
+# BCT → ExtraTrees (R²=0.9999)
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models_ml")
 
@@ -47,14 +48,19 @@ soh_model = None
 rul_model = None
 bct_model = None
 feature_scaler = None
+exp_params = {"C0": 0.5, "a": 0.5, "b": -30, "nominal_capacity": 2.0, "failure_threshold": 0.8}  # defaults
+
+def single_exp_model(k, C0, a, b):
+    """Single exponential degradation: C_k = C0 + a * exp(b/k) [Paper Eq. 4]"""
+    return C0 + a * np.exp(b / max(k, 1))
 
 def load_models():
-    """Load trained ML models and scaler at startup"""
-    global soh_model, rul_model, bct_model, feature_scaler
+    """Load trained ML models, scaler, and exponential params at startup"""
+    global soh_model, rul_model, bct_model, feature_scaler, exp_params
     
     model_files = {
-        "soh": "soh_model_xgboost.pkl",
-        "rul": "rul_model_xgboost.pkl",
+        "soh": "soh_model.pkl",
+        "rul": "rul_model.pkl",
         "bct": "bct_model.pkl",
         "scaler": "feature_scaler.pkl",
     }
@@ -75,6 +81,16 @@ def load_models():
             print(f"Loaded {key}: {filename}")
         except Exception as e:
             print(f"Warning: {key} model not found: {e}")
+    
+    # Load exponential degradation params from paper-based training
+    exp_path = os.path.join(MODEL_DIR, "exp_params.json")
+    try:
+        import json
+        with open(exp_path, "r") as f:
+            exp_params = json.load(f)
+        print(f"Loaded exponential params: C0={exp_params['C0']:.4f}, a={exp_params['a']:.4f}, b={exp_params['b']:.2f}")
+    except Exception as e:
+        print(f"Warning: exp_params not loaded: {e}")
 
 # Load models immediately
 load_models()
@@ -156,14 +172,14 @@ THRESHOLDS = {
 
 # ============== ML Prediction Functions ==============
 #
-# KEY DESIGN: Voltage is the PRIMARY signal for battery health.
-#   - New battery: ~4.2V → SOH ~100%, RUL ~249 cycles
-#   - Mid-life:   ~3.6V → SOH ~50-60%
-#   - Dead:       ~3.0V → SOH ~0%, RUL 0 (motor needs 3V min)
+# RESEARCH PAPER-BASED: Patrizi et al. (2024), Sensors 24, 3382
+# Uses single exponential degradation model + 12-feature ML models.
+# SOH = C_k / C_rated (Eq. 5)
+# RUL = cycles until SOH < 80% (failure threshold)
+# Exponential: C_k = C0 + a * exp(b/k) (Eq. 4)
 #
-# The actual battery voltage tells us WHERE in the lifecycle the battery is.
-# We estimate an "effective cycle" from voltage, then feed consistent features
-# to the ML model so predictions react to real voltage/current changes.
+# Voltage is STILL the primary signal for real-time health estimation.
+# We map voltage to an effective cycle, then compute 12 features.
 
 # Battery voltage thresholds
 BATTERY_FULL_VOLTAGE = 3.88   # User specified 100%
@@ -245,14 +261,29 @@ def build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_volt
         cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp
     )
     
-    # Compute Internal Resistance (IR) proxy - physics feature
-    # IR = (Avg Charge V - Avg Discharge V) / (Avg Charge I + Avg Discharge I)
-    # Using mapped values ensures consistency with training data range
-    ir_val = (m_chV - m_disV) / (m_chI + m_disI)
+    # Compute Internal Resistance (IR) proxy
+    ir_val = (m_chV - m_disV) / (m_chI + m_disI) if (m_chI + m_disI) > 0 else 0
     
-    # 8 features in order matching training: cycle, chI, chV, chT, disI, disV, disT, IR
+    # Polynomial features [Paper Eq. 7]
+    sqrt_cycle = np.sqrt(m_cycle)
+    cycle_sq = m_cycle ** 2
+    
+    # Exponential model capacity prediction [Paper Eq. 4]
+    exp_cap = single_exp_model(float(m_cycle), exp_params['C0'], exp_params['a'], exp_params['b'])
+    # Capacity residual: how much actual capacity deviates from exponential prediction
+    # For real-time, use health_fraction * nominal_capacity as proxy for actual capacity
+    health_frac = max(0, min(1, (max(ch_voltage, dis_voltage) - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)))
+    approx_capacity = health_frac * exp_params.get('nominal_capacity', 2.0)
+    cap_residual = approx_capacity - exp_cap
+    
+    # Temperature stress indicator
+    temp_diff = m_disT - m_chT
+    
+    # 12 features matching training order:
+    # cycle, chI, chV, chT, disI, disV, disT, IR, sqrt_cycle, cycle_sq, cap_residual, temp_diff
     raw = np.array([[
-        m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT, ir_val
+        m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT,
+        ir_val, sqrt_cycle, cycle_sq, cap_residual, temp_diff
     ]])
     
     if feature_scaler is not None:

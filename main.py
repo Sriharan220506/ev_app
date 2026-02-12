@@ -166,7 +166,7 @@ THRESHOLDS = {
 # to the ML model so predictions react to real voltage/current changes.
 
 # Battery voltage thresholds
-BATTERY_FULL_VOLTAGE = 4.2    # Fully charged li-ion cell
+BATTERY_FULL_VOLTAGE = 3.88   # Fully charged/New battery (User specified)
 BATTERY_DEAD_VOLTAGE = 3.0    # Motor minimum operating voltage
 MAX_CYCLES = 250              # From dataset
 

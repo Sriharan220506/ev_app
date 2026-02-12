@@ -155,68 +155,110 @@ THRESHOLDS = {
 }
 
 # ============== ML Prediction Functions ==============
-# Features order: [cycle, chI, chV, chT, disI, disV, disT]
 #
-# IMPORTANT: The dataset was collected from lab batteries at ~1.4A charging / ~2A discharge.
-# The Arduino INA219 reads actual sensor values (often milliamps).
-# We must map Arduino values → dataset ranges before prediction.
+# KEY DESIGN: Voltage is the PRIMARY signal for battery health.
+#   - New battery: ~4.2V → SOH ~100%, RUL ~249 cycles
+#   - Mid-life:   ~3.6V → SOH ~50-60%
+#   - Dead:       ~3.0V → SOH ~0%, RUL 0 (motor needs 3V min)
+#
+# The actual battery voltage tells us WHERE in the lifecycle the battery is.
+# We estimate an "effective cycle" from voltage, then feed consistent features
+# to the ML model so predictions react to real voltage/current changes.
 
-# Dataset value ranges (from Battery_dataset.csv)
+# Battery voltage thresholds
+BATTERY_FULL_VOLTAGE = 4.2    # Fully charged li-ion cell
+BATTERY_DEAD_VOLTAGE = 3.0    # Motor minimum operating voltage
+MAX_CYCLES = 250              # From dataset
+
+# Dataset value ranges (from Battery_dataset.csv) for feature scaling
 DATASET_RANGES = {
-    "cycle":  {"min": 1,      "max": 250},
-    "chI":    {"min": 1.0009, "max": 1.7475,  "mean": 1.4001},
-    "chV":    {"min": 4.0351, "max": 4.3592,  "mean": 4.2028},
-    "chT":    {"min": 21.60,  "max": 30.91,   "mean": 26.87},
-    "disI":   {"min": 1.7024, "max": 2.4112,  "mean": 2.0076},
-    "disV":   {"min": 2.4849, "max": 4.3635,  "mean": 3.5011},
-    "disT":   {"min": 26.85,  "max": 38.39,   "mean": 33.10},
+    "chI":  {"min": 1.0009, "max": 1.7475, "mean": 1.4001},
+    "chV":  {"min": 4.0351, "max": 4.3592, "new": 4.35, "old": 4.04},
+    "chT":  {"min": 21.60,  "max": 30.91,  "new": 25.0, "old": 30.0},
+    "disI": {"min": 1.7024, "max": 2.4112, "mean": 2.0076},
+    "disV": {"min": 2.4849, "max": 4.3635, "new": 4.30, "old": 2.50},
+    "disT": {"min": 26.85,  "max": 38.39,  "new": 32.0, "old": 38.0},
 }
 
-def map_arduino_to_dataset(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
+def estimate_effective_cycle(voltage):
+    """
+    Estimate battery lifecycle position from actual voltage.
+    4.2V → cycle 1 (brand new)   |   3.0V → cycle 250 (dead)
+    This is the KEY function that makes predictions voltage-responsive.
+    """
+    # Clamp voltage to valid range
+    v = max(BATTERY_DEAD_VOLTAGE, min(BATTERY_FULL_VOLTAGE, voltage))
+    # Linear interpolation: higher voltage = lower cycle (newer battery)
+    # voltage 4.2 → cycle 1, voltage 3.0 → cycle 250
+    health_fraction = (v - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)
+    effective_cycle = int(1 + (1 - health_fraction) * (MAX_CYCLES - 1))
+    return max(1, min(MAX_CYCLES, effective_cycle))
+
+def map_arduino_to_dataset(cycle_count, ch_current, ch_voltage, ch_temp,
+                            dis_current, dis_voltage, dis_temp):
     """
     Map Arduino sensor values to dataset-equivalent ranges.
-    The model expects values in the dataset's scale, not raw milliamp readings.
+    
+    Strategy:
+    1. Use the ACTUAL voltage to estimate effective lifecycle position
+    2. Map current values proportionally to dataset ranges
+    3. Temperature: use actual values clipped to dataset range
+    4. Voltage: map proportionally so the model sees voltage changes
     """
-    # Cycle: use directly (1-250 range)
-    mapped_cycle = max(1, min(250, cycle))
+    # Step 1: Determine the primary voltage — use whichever is active
+    primary_voltage = max(ch_voltage, dis_voltage) if dis_voltage > 0.1 else ch_voltage
+    if primary_voltage < 1.0:
+        primary_voltage = ch_voltage  # fallback to charging voltage
     
-    # Charging current: Arduino sends small values (mA range)
-    # Map SOC-based or proportional to dataset range ~1.0-1.75
-    if ch_current > 0.001:  # if actually charging
-        # Scale: higher current = proportionally higher in dataset range
-        mapped_chI = np.clip(1.0 + (ch_current / 2.0) * 0.75, 1.0, 1.75)
+    # Step 2: Estimate effective cycle from voltage (THE KEY INSIGHT)
+    eff_cycle = estimate_effective_cycle(primary_voltage)
+    
+    # If user's cycle_count is also meaningful (> 0), blend with voltage estimate
+    # But voltage takes priority since it reflects actual battery state
+    if cycle_count > 0:
+        mapped_cycle = max(1, min(250, int(0.3 * cycle_count + 0.7 * eff_cycle)))
     else:
-        # Not charging: use mean value (won't dominate prediction)
-        mapped_chI = DATASET_RANGES["chI"]["mean"]
+        mapped_cycle = eff_cycle
     
-    # Charging voltage: Arduino ~3.7-4.2V, dataset ~4.03-4.36V
-    # Linear map from Arduino range to dataset range
-    mapped_chV = np.clip(
-        4.035 + (ch_voltage - 3.7) / (4.2 - 3.7) * (4.36 - 4.035),
-        4.035, 4.36
+    # Step 3: Health fraction (0 = dead, 1 = new) from voltage
+    health = max(0, min(1, (primary_voltage - BATTERY_DEAD_VOLTAGE) / 
+                            (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)))
+    
+    # Step 4: Map features proportionally to health level
+    # Charging current: dataset range ~1.0-1.75, healthier = higher
+    mapped_chI = DATASET_RANGES["chI"]["min"] + health * (DATASET_RANGES["chI"]["max"] - DATASET_RANGES["chI"]["min"])
+    
+    # Charging voltage: dataset range ~4.04-4.36, healthier = higher
+    mapped_chV = DATASET_RANGES["chV"]["old"] + health * (DATASET_RANGES["chV"]["new"] - DATASET_RANGES["chV"]["old"])
+    
+    # Charging temperature: healthier = cooler (25-30°C range)
+    mapped_chT = DATASET_RANGES["chT"]["old"] - health * (DATASET_RANGES["chT"]["old"] - DATASET_RANGES["chT"]["new"])
+    # Also factor in actual temperature
+    if 15 <= ch_temp <= 45:
+        mapped_chT = np.clip(0.5 * mapped_chT + 0.5 * ch_temp, 
+                             DATASET_RANGES["chT"]["min"], DATASET_RANGES["chT"]["max"])
+    
+    # Discharge current: dataset range ~1.7-2.4, healthier = lower (less resistance)
+    mapped_disI = DATASET_RANGES["disI"]["max"] - health * (DATASET_RANGES["disI"]["max"] - DATASET_RANGES["disI"]["min"])
+    
+    # Discharge voltage: dataset range ~2.48-4.36 — THIS IS THE STRONGEST SIGNAL
+    # Map directly from actual voltage!
+    mapped_disV = np.clip(
+        DATASET_RANGES["disV"]["min"] + health * (DATASET_RANGES["disV"]["max"] - DATASET_RANGES["disV"]["min"]),
+        DATASET_RANGES["disV"]["min"], DATASET_RANGES["disV"]["max"]
     )
     
-    # Charging temperature: Arduino ~20-40°C, dataset ~21-31°C — close enough, just clip
-    mapped_chT = np.clip(ch_temp, 21.6, 30.9)
-    
-    # Discharge current: Arduino sends small values
-    # Map to dataset range ~1.7-2.4
-    if dis_current > 0.001:  # if actually discharging
-        mapped_disI = np.clip(1.7 + (dis_current / 2.0) * 0.7, 1.7, 2.41)
-    else:
-        mapped_disI = DATASET_RANGES["disI"]["mean"]
-    
-    # Discharge voltage: Arduino ~3.0-4.2V, dataset ~2.48-4.36V — fairly close
-    mapped_disV = np.clip(dis_voltage, 2.48, 4.36)
-    
-    # Discharge temperature: Arduino ~20-40°C, dataset ~27-38°C — clip
-    mapped_disT = np.clip(dis_temp, 26.85, 38.39)
+    # Discharge temperature: healthier = cooler
+    mapped_disT = DATASET_RANGES["disT"]["old"] - health * (DATASET_RANGES["disT"]["old"] - DATASET_RANGES["disT"]["new"])
+    if 15 <= dis_temp <= 50:
+        mapped_disT = np.clip(0.5 * mapped_disT + 0.5 * dis_temp,
+                              DATASET_RANGES["disT"]["min"], DATASET_RANGES["disT"]["max"])
     
     return mapped_cycle, mapped_chI, mapped_chV, mapped_chT, mapped_disI, mapped_disV, mapped_disT
 
 def build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
     """Build the 15-feature array: 7 base (mapped) + 8 health indicators → scale"""
-    # First map Arduino values to dataset ranges
+    # Map Arduino values to dataset ranges (voltage-driven)
     m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT = map_arduino_to_dataset(
         cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp
     )
@@ -231,9 +273,7 @@ def build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_volt
     current_ratio = m_disI / m_chI if m_chI > 0 else 1.0
     temp_stress = m_disT * m_disI
     
-    # 15 features in order: [cycle, chI, chV, chT, disI, disV, disT,
-    #   voltage_rise, temp_diff, peak_temp, discharge_capacity,
-    #   charge_energy, efficiency, current_ratio, temp_stress]
+    # 15 features in order matching training
     raw = np.array([[
         m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT,
         voltage_rise, temp_diff, peak_temp, discharge_capacity,
@@ -245,21 +285,20 @@ def build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_volt
     return raw
 
 def predict_soh_ml(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
-    """Predict SOH using GradientBoosting model (R²=0.9997)"""
+    """Predict SOH — primarily driven by battery voltage"""
     if soh_model is None:
-        return predict_soh_fallback(ch_voltage, cycle, ch_temp)
+        return predict_soh_fallback(max(ch_voltage, dis_voltage), cycle, ch_temp)
     try:
         features = build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp)
         prediction = soh_model.predict(features)[0]
         return float(max(0, min(100, prediction)))
     except Exception as e:
-        print(f"SOH ML error: {e}")
-        return predict_soh_fallback(ch_voltage, cycle, ch_temp)
+        return predict_soh_fallback(max(ch_voltage, dis_voltage), cycle, ch_temp)
 
 def predict_rul_ml(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
-    """Predict RUL using RandomForest model (R²=0.9055)"""
+    """Predict RUL — remaining cycles until voltage drops below 3.0V"""
     if rul_model is None:
-        return predict_rul_fallback(100, cycle)
+        return predict_rul_fallback(max(ch_voltage, dis_voltage), cycle)
     try:
         features = build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp)
         prediction = rul_model.predict(features)[0]
@@ -267,43 +306,49 @@ def predict_rul_ml(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_volt
         months = int(remaining_cycles / 30)
         return {"cycles": remaining_cycles, "months": months}
     except Exception as e:
-        print(f"RUL ML error: {e}")
-        return predict_rul_fallback(100, cycle)
+        return predict_rul_fallback(max(ch_voltage, dis_voltage), cycle)
 
 def predict_bct_ml(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
-    """Predict Battery Condition (BCT) using GradientBoosting model (R²=0.9997)"""
+    """Predict Battery Capacity — higher = better condition"""
     if bct_model is None:
-        return 1.0  # default mid-range
+        return predict_bct_fallback(max(ch_voltage, dis_voltage))
     try:
         features = build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp)
         prediction = bct_model.predict(features)[0]
         return float(max(0, prediction))
     except Exception as e:
-        print(f"BCT ML error: {e}")
-        return 1.0
+        return predict_bct_fallback(max(ch_voltage, dis_voltage))
 
-# ============== Fallback Predictions ==============
+# ============== Fallback Predictions (voltage-based) ==============
 
 def predict_soh_fallback(voltage, cycle_count, temperature):
-    """Rule-based SOH fallback"""
-    voltage_factor = min(100, max(0, (voltage - 3.0) / 1.2 * 100))
-    cycle_factor = max(0, 100 - (cycle_count * 0.2))
+    """Voltage-based SOH fallback — 4.2V=100%, 3.0V=0%"""
+    health = max(0, min(1, (voltage - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)))
+    voltage_soh = health * 100
+    cycle_factor = max(0, 100 - (cycle_count * 0.4)) if cycle_count > 0 else 100
     temp_factor = 100 if 15 <= temperature <= 35 else 90
-    soh = (voltage_factor * 0.3 + cycle_factor * 0.5 + temp_factor * 0.2)
+    soh = (voltage_soh * 0.6 + cycle_factor * 0.2 + temp_factor * 0.2)
     return max(0, min(100, soh))
 
-def predict_rul_fallback(soh, cycle_count):
-    """Rule-based RUL fallback"""
-    max_cycles = 250
-    remaining_cycles = int((soh / 100) * max_cycles - cycle_count)
-    remaining_cycles = max(0, remaining_cycles)
+def predict_rul_fallback(voltage, cycle_count):
+    """Voltage-based RUL fallback"""
+    health = max(0, min(1, (voltage - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)))
+    remaining_cycles = int(health * MAX_CYCLES)
     months = int(remaining_cycles / 30)
     return {"cycles": remaining_cycles, "months": months}
 
-def calculate_eul(cycle_count):
-    """Calculate Estimated Used Life percentage"""
-    max_cycles = 250
-    return min(100, (cycle_count / max_cycles) * 100)
+def predict_bct_fallback(voltage):
+    """Voltage-based BCT fallback"""
+    health = max(0, min(1, (voltage - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)))
+    return 0.75 + health * 1.24  # Range: 0.75 (dead) to 1.99 (new)
+
+def calculate_eul(cycle_count, voltage=None):
+    """Calculate Estimated Used Life percentage.
+    If voltage is provided, use it as primary indicator."""
+    if voltage is not None and voltage > 0:
+        health = max(0, min(1, (voltage - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)))
+        return min(100, (1 - health) * 100)
+    return min(100, (cycle_count / MAX_CYCLES) * 100)
 
 def detect_battery_condition(voltage, soc, internal_resistance, cycle_count, used_capacity):
     """Detect if the connected battery is NEW or OLD based on sensor values"""
@@ -480,7 +525,7 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
         data.chargingCurrent, data.chargingVoltage, data.chargingTemp,
         data.dischargingCurrent, data.dischargingVoltage, data.dischargingTemp
     )
-    eul = calculate_eul(data.cycleCount)
+    eul = calculate_eul(data.cycleCount, max(data.chargingVoltage, data.dischargingVoltage))
     
     model_type = "ml-trained" if soh_model else "rule-based"
     confidence = 0.95 if soh_model else 0.70

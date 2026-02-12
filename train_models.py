@@ -1,7 +1,6 @@
 """
-Train ML models for SOH, RUL, and BCT prediction
-Compare XGBoost, Random Forest, Gradient Boosting
-Pick the best model for each target
+Train ML models for SOH, RUL, and BCT prediction — Fixed version
+Each target gets FRESH model instances (not shared).
 """
 
 import pandas as pd
@@ -21,9 +20,6 @@ warnings.filterwarnings('ignore')
 # ============================
 df = pd.read_csv(r'c:\Users\SriHaran\Documents\Projects\evapp\DATASET\Battery_dataset.csv')
 print(f"Dataset: {df.shape[0]} rows, {df.shape[1]} columns")
-print(f"Batteries: {df['battery_id'].unique()}")
-print(f"Columns: {list(df.columns)}")
-print()
 
 # Features: cycle, chI, chV, chT, disI, disV, disT
 feature_cols = ['cycle', 'chI', 'chV', 'chT', 'disI', 'disV', 'disT']
@@ -34,7 +30,7 @@ y_soh = df['SOH'].values
 y_rul = df['RUL'].values
 y_bct = df['BCt'].values
 
-# Train/test split (same split for all)
+# Same split for all targets
 X_train, X_test, y_soh_train, y_soh_test = train_test_split(X, y_soh, test_size=0.2, random_state=42)
 _, _, y_rul_train, y_rul_test = train_test_split(X, y_rul, test_size=0.2, random_state=42)
 _, _, y_bct_train, y_bct_test = train_test_split(X, y_bct, test_size=0.2, random_state=42)
@@ -46,121 +42,116 @@ X_test_scaled = scaler.transform(X_test)
 
 print(f"Train: {X_train.shape[0]}  |  Test: {X_test.shape[0]}")
 print(f"Features: {feature_cols}")
-print()
+
+output_dir = r'c:\Users\SriHaran\Documents\Projects\evapp\backend\models_ml'
+os.makedirs(output_dir, exist_ok=True)
 
 # ============================
-# 2. Define Models
+# 2. Helper function
 # ============================
-models = {
-    'XGBoost': XGBRegressor(
-        n_estimators=300, max_depth=6, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8, random_state=42,
-        verbosity=0
-    ),
-    'RandomForest': RandomForestRegressor(
-        n_estimators=300, max_depth=12, min_samples_split=5,
-        min_samples_leaf=2, random_state=42, n_jobs=-1
-    ),
-    'GradientBoosting': GradientBoostingRegressor(
-        n_estimators=300, max_depth=5, learning_rate=0.05,
-        subsample=0.8, random_state=42
-    ),
-}
+def create_models():
+    """Create FRESH model instances — must be called for each target"""
+    return {
+        'XGBoost': XGBRegressor(
+            n_estimators=300, max_depth=6, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, random_state=42, verbosity=0
+        ),
+        'RandomForest': RandomForestRegressor(
+            n_estimators=300, max_depth=12, min_samples_split=5,
+            min_samples_leaf=2, random_state=42, n_jobs=-1
+        ),
+        'GradientBoosting': GradientBoostingRegressor(
+            n_estimators=300, max_depth=5, learning_rate=0.05,
+            subsample=0.8, random_state=42
+        ),
+    }
 
-# ============================
-# 3. Train & Evaluate
-# ============================
-results = {}
-
-def train_and_evaluate(target_name, y_train, y_test):
-    print(f"\n{'=' * 60}")
-    print(f"  TARGET: {target_name}")
-    print(f"{'=' * 60}")
-    print(f"  Range: {y_train.min():.2f} — {y_train.max():.2f}")
+def train_and_pick_best(target_name, y_train, y_test):
+    """Train all 3 models on one target and return the best"""
+    print(f"\n{'='*60}")
+    print(f"  TARGET: {target_name}  (range: {y_train.min():.2f} — {y_train.max():.2f})")
+    print(f"{'='*60}")
     
+    models = create_models()  # Fresh instances!
     best_model = None
     best_name = None
     best_r2 = -999
-    target_results = {}
     
     for name, model in models.items():
-        # Train
         model.fit(X_train_scaled, y_train)
-        
-        # Predict
         y_pred = model.predict(X_test_scaled)
         
-        # Metrics
         mae = mean_absolute_error(y_test, y_pred)
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
         r2 = r2_score(y_test, y_pred)
+        cv = cross_val_score(model, X_train_scaled, y_train, cv=5, scoring='r2').mean()
         
-        # Cross-val
-        cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=5, scoring='r2')
-        cv_mean = cv_scores.mean()
-        
-        target_results[name] = {
-            'mae': mae, 'rmse': rmse, 'r2': r2,
-            'cv_r2': cv_mean, 'model': model
-        }
-        
-        print(f"\n  {name}:")
-        print(f"    MAE:    {mae:.4f}")
-        print(f"    RMSE:   {rmse:.4f}")
-        print(f"    R²:     {r2:.4f}")
-        print(f"    CV R²:  {cv_mean:.4f}  (5-fold)")
+        print(f"  {name:20s}  R²={r2:.4f}  MAE={mae:.4f}  RMSE={rmse:.4f}  CV={cv:.4f}")
         
         if r2 > best_r2:
             best_r2 = r2
             best_name = name
             best_model = model
     
-    print(f"\n  ✅ BEST for {target_name}: {best_name} (R² = {best_r2:.4f})")
-    return best_name, best_model, target_results
-
-# Train for each target
-soh_best_name, soh_best_model, soh_results = train_and_evaluate("SOH", y_soh_train, y_soh_test)
-rul_best_name, rul_best_model, rul_results = train_and_evaluate("RUL", y_rul_train, y_rul_test)
-bct_best_name, bct_best_model, bct_results = train_and_evaluate("BCT", y_bct_train, y_bct_test)
-
-# ============================
-# 4. Summary
-# ============================
-print(f"\n{'=' * 60}")
-print(f"  FINAL RESULTS SUMMARY")
-print(f"{'=' * 60}")
-print(f"  SOH:  {soh_best_name:20s}  R² = {soh_results[soh_best_name]['r2']:.4f}  MAE = {soh_results[soh_best_name]['mae']:.4f}")
-print(f"  RUL:  {rul_best_name:20s}  R² = {rul_results[rul_best_name]['r2']:.4f}  MAE = {rul_results[rul_best_name]['mae']:.4f}")
-print(f"  BCT:  {bct_best_name:20s}  R² = {bct_results[bct_best_name]['r2']:.4f}  MAE = {bct_results[bct_best_name]['mae']:.4f}")
+    # Verify the best model predicts in the right range
+    test_pred = best_model.predict(X_test_scaled)
+    print(f"  ✅ BEST: {best_name} (R²={best_r2:.4f})")
+    print(f"     Prediction range: {test_pred.min():.2f} — {test_pred.max():.2f}")
+    print(f"     Actual range:     {y_test.min():.2f} — {y_test.max():.2f}")
+    
+    return best_name, best_model
 
 # ============================
-# 5. Save Best Models
+# 3. Train Each Target
 # ============================
-output_dir = r'c:\Users\SriHaran\Documents\Projects\evapp\backend\models_ml'
-os.makedirs(output_dir, exist_ok=True)
+soh_name, soh_model = train_and_pick_best("SOH", y_soh_train, y_soh_test)
+rul_name, rul_model = train_and_pick_best("RUL", y_rul_train, y_rul_test)
+bct_name, bct_model = train_and_pick_best("BCT", y_bct_train, y_bct_test)
 
-# Save models
+# ============================
+# 4. Verify models aren't mixed up
+# ============================
+print(f"\n{'='*60}")
+print(f"  VERIFICATION: Quick sanity check")
+print(f"{'='*60}")
+
+# Test with cycle=1 (new battery should have high SOH, high RUL)
+new_battery = scaler.transform(np.array([[1, 1.4, 4.25, 27.0, 2.0, 3.9, 33.0]]))
+soh_pred = soh_model.predict(new_battery)[0]
+rul_pred = rul_model.predict(new_battery)[0]
+bct_pred = bct_model.predict(new_battery)[0]
+print(f"  New battery (cycle=1):")
+print(f"    SOH = {soh_pred:.2f}%  (should be ~98-99%)")
+print(f"    RUL = {int(rul_pred)} cycles  (should be ~240-249)")
+print(f"    BCT = {bct_pred:.4f}  (should be ~1.97)")
+
+# Test with cycle=200 (old battery should have low SOH, low RUL)
+old_battery = scaler.transform(np.array([[200, 1.3, 4.1, 29.0, 1.8, 3.0, 36.0]]))
+soh_pred2 = soh_model.predict(old_battery)[0]
+rul_pred2 = rul_model.predict(old_battery)[0]
+bct_pred2 = bct_model.predict(old_battery)[0]
+print(f"  Old battery (cycle=200):")
+print(f"    SOH = {soh_pred2:.2f}%  (should be ~50-60%)")
+print(f"    RUL = {int(rul_pred2)} cycles  (should be ~40-50)")
+print(f"    BCT = {bct_pred2:.4f}  (should be ~0.9-1.0)")
+
+# ============================
+# 5. Save Models
+# ============================
 with open(os.path.join(output_dir, 'soh_model_xgboost.pkl'), 'wb') as f:
-    pickle.dump(soh_best_model, f)
-print(f"\n  Saved SOH model ({soh_best_name})")
+    pickle.dump(soh_model, f)
+print(f"\n  Saved SOH model ({soh_name})")
 
 with open(os.path.join(output_dir, 'rul_model_xgboost.pkl'), 'wb') as f:
-    pickle.dump(rul_best_model, f)
-print(f"  Saved RUL model ({rul_best_name})")
+    pickle.dump(rul_model, f)
+print(f"  Saved RUL model ({rul_name})")
 
 with open(os.path.join(output_dir, 'bct_model.pkl'), 'wb') as f:
-    pickle.dump(bct_best_model, f)
-print(f"  Saved BCT model ({bct_best_name})")
+    pickle.dump(bct_model, f)
+print(f"  Saved BCT model ({bct_name})")
 
-# Save scaler
 with open(os.path.join(output_dir, 'feature_scaler.pkl'), 'wb') as f:
     pickle.dump(scaler, f)
 print(f"  Saved feature scaler")
 
-# Save feature names for reference
-with open(os.path.join(output_dir, 'feature_names.txt'), 'w') as f:
-    f.write(','.join(feature_cols))
-print(f"  Saved feature names: {feature_cols}")
-
-print(f"\n  All models saved to: {output_dir}")
-print("  DONE!")
+print(f"\n  DONE! All models saved to {output_dir}")

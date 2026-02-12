@@ -53,8 +53,8 @@ def load_models():
     global soh_model, rul_model, bct_model, feature_scaler
     
     model_files = {
-        "soh": "soh_model.pkl",
-        "rul": "rul_model.pkl",
+        "soh": "soh_model_xgboost.pkl",
+        "rul": "rul_model_xgboost.pkl",
         "bct": "bct_model.pkl",
         "scaler": "feature_scaler.pkl",
     }
@@ -322,52 +322,24 @@ def calculate_eul(cycle_count, voltage=None):
         return min(100, (1 - health) * 100)
     return min(100, (cycle_count / MAX_CYCLES) * 100)
 
+def calculate_soc_from_voltage(voltage):
+    """Calculate SOC from voltage: 3.88V=100%, 2.0V=0%"""
+    soc = max(0, min(100, (voltage - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE) * 100))
+    return round(soc, 1)
 
-    
 def detect_battery_condition(voltage, soc, internal_resistance, cycle_count, used_capacity):
-    """Detect if the connected battery is NEW or OLD based on sensor values (3.88V base)"""
-    score = 0
+    """Detect if the connected battery is NEW or OLD based on voltage-driven SOH"""
+    # Primary: use voltage health (3.88V=100%, 2.0V=0%)
+    health = max(0, min(1, (voltage - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)))
     
-    # High voltage = new battery (>= 3.80V for 100% SOH at 3.88V)
-    if voltage >= 3.80:
-        score += 25
-    elif voltage >= 3.40:
-        score += 15
+    if health >= 0.85:
+        return {"condition": "NEW", "score": int(health * 100), "detail": f"Battery is new/healthy ({voltage:.2f}V)"}
+    elif health >= 0.60:
+        return {"condition": "GOOD", "score": int(health * 100), "detail": f"Battery in good condition ({voltage:.2f}V)"}
+    elif health >= 0.35:
+        return {"condition": "AGED", "score": int(health * 100), "detail": f"Battery shows wear ({voltage:.2f}V)"}
     else:
-        score += 5
-    
-    # Low internal resistance = new battery (< 30 mΩ)
-    if internal_resistance < 30:
-        score += 25
-    elif internal_resistance < 50:
-        score += 15
-    else:
-        score += 0
-    
-    # Low cycle count = new battery
-    if cycle_count <= 5:
-        score += 25
-    elif cycle_count <= 50:
-        score += 15
-    else:
-        score += 5
-    
-    # Low used capacity = new battery
-    if used_capacity < 0.2:
-        score += 25
-    elif used_capacity < 2.0:
-        score += 15
-    else:
-        score += 5
-    
-    if score >= 80:
-        return {"condition": "NEW", "score": score, "detail": "Battery appears to be new or near-new"}
-    elif score >= 50:
-        return {"condition": "GOOD", "score": score, "detail": "Battery is in good used condition"}
-    elif score >= 30:
-        return {"condition": "AGED", "score": score, "detail": "Battery shows significant wear"}
-    else:
-        return {"condition": "OLD", "score": score, "detail": "Battery is heavily degraded"}
+        return {"condition": "OLD", "score": int(health * 100), "detail": f"Battery heavily degraded ({voltage:.2f}V)"}
 
 def check_alerts(telemetry: Telemetry, db: Session):
     """Check telemetry against thresholds and create alerts (with deduplication)"""
@@ -455,22 +427,37 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
         vehicle = Vehicle(id=data.vehicleId, name=f"Vehicle {data.vehicleId}")
         db.add(vehicle)
     
-    # FORCE SOC CALCULATION based on voltage (3.88V=100%, 2.0V=0%)
-    # This ensures "charging increasing" works in the dashboard
-    v_soc = max(0, min(100, (data.voltage - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE) * 100))
-    data.soc = v_soc
+    # --- Server-side Cycle Counting ---
+    # A cycle = full discharge then full charge.
+    # Detect transition: previous record was DISCHARGING, now CHARGING.
+    prev = db.query(Telemetry)\
+        .filter(Telemetry.vehicle_id == data.vehicleId)\
+        .order_by(desc(Telemetry.timestamp))\
+        .first()
     
-    # Create telemetry record
+    if prev:
+        server_cycle_count = prev.cycle_count or 0
+        # Transition: was discharging (is_charging=False), now charging (is_charging=True)
+        if not prev.is_charging and data.isCharging:
+            server_cycle_count += 1
+    else:
+        server_cycle_count = data.cycleCount or 0
+    
+    # --- Compute SOC from Voltage (server-side) ---
+    primary_v = max(data.voltage, data.chargingVoltage, data.dischargingVoltage)
+    computed_soc = calculate_soc_from_voltage(primary_v)
+    
+    # Create telemetry record (use server-computed values)
     telemetry = Telemetry(
         vehicle_id=data.vehicleId,
         voltage=data.voltage,
         current=data.current,
         temperature=data.temperature,
         internal_resistance=data.internalResistance,
-        soc=data.soc,
+        soc=computed_soc,
         power=data.power,
         is_charging=data.isCharging,
-        cycle_count=data.cycleCount,
+        cycle_count=server_cycle_count,
         used_capacity=data.usedCapacity,
         charging_voltage=data.chargingVoltage,
         charging_current=data.chargingCurrent,

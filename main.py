@@ -360,7 +360,40 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
     # Check for alerts
     check_alerts(telemetry, db)
     
-    # ML Predictions
+    # ========== PRINT ARDUINO INPUTS ==========
+    print("\n" + "=" * 60)
+    print("📡 TELEMETRY RECEIVED FROM ARDUINO")
+    print("=" * 60)
+    print(f"  Vehicle:           {data.vehicleId}")
+    print(f"  Voltage:           {data.voltage:.3f} V")
+    print(f"  Current:           {data.current:.4f} A  ({data.current * 1000:.1f} mA)")
+    print(f"  Power:             {data.power:.4f} W  ({data.power * 1000:.1f} mW)")
+    print(f"  Temperature:       {data.temperature:.1f} °C")
+    print(f"  SOC:               {data.soc:.1f} %")
+    print(f"  Is Charging:       {data.isCharging}")
+    print(f"  Cycle Count:       {data.cycleCount}")
+    print(f"  Internal Resist:   {data.internalResistance:.2f} mΩ")
+    print(f"  Used Capacity:     {data.usedCapacity:.4f} Ah")
+    print(f"  --- Charging Values ---")
+    print(f"  Chg Voltage:       {data.chargingVoltage:.3f} V")
+    print(f"  Chg Current:       {data.chargingCurrent:.4f} A")
+    print(f"  Chg Temp:          {data.chargingTemp:.1f} °C")
+    print(f"  Chg Power:         {data.chargingPower:.4f} W")
+    print(f"  --- Discharging Values ---")
+    print(f"  Dis Voltage:       {data.dischargingVoltage:.3f} V")
+    print(f"  Dis Current:       {data.dischargingCurrent:.4f} A")
+    print(f"  Dis Temp:          {data.dischargingTemp:.1f} °C")
+    print(f"  Dis Power:         {data.dischargingPower:.4f} W")
+    
+    # ========== ML PREDICTIONS ==========
+    ml_features = [
+        data.voltage, abs(data.current), abs(data.power), data.temperature,
+        data.soc, data.cycleCount, data.internalResistance, data.usedCapacity
+    ]
+    print(f"\n🧠 ML INPUT FEATURES (8 values):")
+    print(f"  [voltage, |current|, |power|, temp, soc, cycles, resistance, usedCap]")
+    print(f"  {ml_features}")
+    
     soh = predict_soh_ml(
         data.voltage, data.current, data.power, data.temperature,
         data.soc, data.cycleCount, data.internalResistance, data.usedCapacity
@@ -372,6 +405,14 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
     eul = calculate_eul(data.cycleCount)
     
     model_type = "xgboost" if soh_model else "rule-based"
+    
+    print(f"\n📊 ML PREDICTION RESULTS ({model_type}):")
+    print(f"  SOH:               {soh:.2f} %")
+    print(f"  RUL:               {rul['cycles']} cycles  ({rul['months']} months)")
+    print(f"  EUL:               {eul:.2f} %")
+    print(f"  Trend:             {'declining' if soh < 85 else 'stable'}")
+    print(f"  Confidence:        {'0.92' if soh_model else '0.70'}")
+    print("=" * 60 + "\n")
     
     prediction = Prediction(
         vehicle_id=data.vehicleId,

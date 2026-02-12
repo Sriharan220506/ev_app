@@ -156,10 +156,71 @@ THRESHOLDS = {
 
 # ============== ML Prediction Functions ==============
 # Features order: [cycle, chI, chV, chT, disI, disV, disT]
+#
+# IMPORTANT: The dataset was collected from lab batteries at ~1.4A charging / ~2A discharge.
+# The Arduino INA219 reads actual sensor values (often milliamps).
+# We must map Arduino values → dataset ranges before prediction.
+
+# Dataset value ranges (from Battery_dataset.csv)
+DATASET_RANGES = {
+    "cycle":  {"min": 1,      "max": 250},
+    "chI":    {"min": 1.0009, "max": 1.7475,  "mean": 1.4001},
+    "chV":    {"min": 4.0351, "max": 4.3592,  "mean": 4.2028},
+    "chT":    {"min": 21.60,  "max": 30.91,   "mean": 26.87},
+    "disI":   {"min": 1.7024, "max": 2.4112,  "mean": 2.0076},
+    "disV":   {"min": 2.4849, "max": 4.3635,  "mean": 3.5011},
+    "disT":   {"min": 26.85,  "max": 38.39,   "mean": 33.10},
+}
+
+def map_arduino_to_dataset(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
+    """
+    Map Arduino sensor values to dataset-equivalent ranges.
+    The model expects values in the dataset's scale, not raw milliamp readings.
+    """
+    # Cycle: use directly (1-250 range)
+    mapped_cycle = max(1, min(250, cycle))
+    
+    # Charging current: Arduino sends small values (mA range)
+    # Map SOC-based or proportional to dataset range ~1.0-1.75
+    if ch_current > 0.001:  # if actually charging
+        # Scale: higher current = proportionally higher in dataset range
+        mapped_chI = np.clip(1.0 + (ch_current / 2.0) * 0.75, 1.0, 1.75)
+    else:
+        # Not charging: use mean value (won't dominate prediction)
+        mapped_chI = DATASET_RANGES["chI"]["mean"]
+    
+    # Charging voltage: Arduino ~3.7-4.2V, dataset ~4.03-4.36V
+    # Linear map from Arduino range to dataset range
+    mapped_chV = np.clip(
+        4.035 + (ch_voltage - 3.7) / (4.2 - 3.7) * (4.36 - 4.035),
+        4.035, 4.36
+    )
+    
+    # Charging temperature: Arduino ~20-40°C, dataset ~21-31°C — close enough, just clip
+    mapped_chT = np.clip(ch_temp, 21.6, 30.9)
+    
+    # Discharge current: Arduino sends small values
+    # Map to dataset range ~1.7-2.4
+    if dis_current > 0.001:  # if actually discharging
+        mapped_disI = np.clip(1.7 + (dis_current / 2.0) * 0.7, 1.7, 2.41)
+    else:
+        mapped_disI = DATASET_RANGES["disI"]["mean"]
+    
+    # Discharge voltage: Arduino ~3.0-4.2V, dataset ~2.48-4.36V — fairly close
+    mapped_disV = np.clip(dis_voltage, 2.48, 4.36)
+    
+    # Discharge temperature: Arduino ~20-40°C, dataset ~27-38°C — clip
+    mapped_disT = np.clip(dis_temp, 26.85, 38.39)
+    
+    return mapped_cycle, mapped_chI, mapped_chV, mapped_chT, mapped_disI, mapped_disV, mapped_disT
 
 def build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
-    """Build the 7-feature array matching dataset training order"""
-    raw = np.array([[cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp]])
+    """Build the 7-feature array: map Arduino values → dataset ranges → scale"""
+    # First map Arduino values to dataset ranges
+    m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT = map_arduino_to_dataset(
+        cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp
+    )
+    raw = np.array([[m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT]])
     if feature_scaler is not None:
         return feature_scaler.transform(raw)
     return raw

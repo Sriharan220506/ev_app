@@ -166,8 +166,8 @@ THRESHOLDS = {
 # to the ML model so predictions react to real voltage/current changes.
 
 # Battery voltage thresholds
-BATTERY_FULL_VOLTAGE = 3.88   # Fully charged/New battery (User specified)
-BATTERY_DEAD_VOLTAGE = 3.0    # Motor minimum operating voltage
+BATTERY_FULL_VOLTAGE = 3.88   # User specified 100%
+BATTERY_DEAD_VOLTAGE = 2.00   # User specified 0%
 MAX_CYCLES = 250              # From dataset
 
 # Dataset value ranges (from Battery_dataset.csv) for feature scaling
@@ -183,13 +183,11 @@ DATASET_RANGES = {
 def estimate_effective_cycle(voltage):
     """
     Estimate battery lifecycle position from actual voltage.
-    4.2V → cycle 1 (brand new)   |   3.0V → cycle 250 (dead)
-    This is the KEY function that makes predictions voltage-responsive.
+    3.88V → cycle 1 (brand new)   |   2.00V → cycle 250 (dead)
     """
     # Clamp voltage to valid range
     v = max(BATTERY_DEAD_VOLTAGE, min(BATTERY_FULL_VOLTAGE, voltage))
-    # Linear interpolation: higher voltage = lower cycle (newer battery)
-    # voltage 4.2 → cycle 1, voltage 3.0 → cycle 250
+    # Linear interpolation
     health_fraction = (v - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)
     effective_cycle = int(1 + (1 - health_fraction) * (MAX_CYCLES - 1))
     return max(1, min(MAX_CYCLES, effective_cycle))
@@ -198,57 +196,41 @@ def map_arduino_to_dataset(cycle_count, ch_current, ch_voltage, ch_temp,
                             dis_current, dis_voltage, dis_temp):
     """
     Map Arduino sensor values to dataset-equivalent ranges.
-    
-    Strategy:
-    1. Use the ACTUAL voltage to estimate effective lifecycle position
-    2. Map current values proportionally to dataset ranges
-    3. Temperature: use actual values clipped to dataset range
-    4. Voltage: map proportionally so the model sees voltage changes
+    Scales inputs based on the voltage health fraction (3.88V - 2.0V).
     """
-    # Step 1: Determine the primary voltage — use whichever is active
+    # Step 1: Determine primary voltage
     primary_voltage = max(ch_voltage, dis_voltage) if dis_voltage > 0.1 else ch_voltage
     if primary_voltage < 1.0:
-        primary_voltage = ch_voltage  # fallback to charging voltage
+        primary_voltage = ch_voltage
     
-    # Step 2: Estimate effective cycle from voltage (THE KEY INSIGHT)
+    # Step 2: Estimate effective cycle
     eff_cycle = estimate_effective_cycle(primary_voltage)
     
-    # If user's cycle_count is also meaningful (> 0), blend with voltage estimate
-    # But voltage takes priority since it reflects actual battery state
     if cycle_count > 0:
         mapped_cycle = max(1, min(250, int(0.3 * cycle_count + 0.7 * eff_cycle)))
     else:
         mapped_cycle = eff_cycle
     
-    # Step 3: Health fraction (0 = dead, 1 = new) from voltage
+    # Step 3: Health fraction
     health = max(0, min(1, (primary_voltage - BATTERY_DEAD_VOLTAGE) / 
                             (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)))
     
-    # Step 4: Map features proportionally to health level
-    # Charging current: dataset range ~1.0-1.75, healthier = higher
+    # Step 4: Map features
     mapped_chI = DATASET_RANGES["chI"]["min"] + health * (DATASET_RANGES["chI"]["max"] - DATASET_RANGES["chI"]["min"])
-    
-    # Charging voltage: dataset range ~4.04-4.36, healthier = higher
     mapped_chV = DATASET_RANGES["chV"]["old"] + health * (DATASET_RANGES["chV"]["new"] - DATASET_RANGES["chV"]["old"])
     
-    # Charging temperature: healthier = cooler (25-30°C range)
     mapped_chT = DATASET_RANGES["chT"]["old"] - health * (DATASET_RANGES["chT"]["old"] - DATASET_RANGES["chT"]["new"])
-    # Also factor in actual temperature
     if 15 <= ch_temp <= 45:
         mapped_chT = np.clip(0.5 * mapped_chT + 0.5 * ch_temp, 
                              DATASET_RANGES["chT"]["min"], DATASET_RANGES["chT"]["max"])
     
-    # Discharge current: dataset range ~1.7-2.4, healthier = lower (less resistance)
     mapped_disI = DATASET_RANGES["disI"]["max"] - health * (DATASET_RANGES["disI"]["max"] - DATASET_RANGES["disI"]["min"])
     
-    # Discharge voltage: dataset range ~2.48-4.36 — THIS IS THE STRONGEST SIGNAL
-    # Map directly from actual voltage!
     mapped_disV = np.clip(
         DATASET_RANGES["disV"]["min"] + health * (DATASET_RANGES["disV"]["max"] - DATASET_RANGES["disV"]["min"]),
         DATASET_RANGES["disV"]["min"], DATASET_RANGES["disV"]["max"]
     )
     
-    # Discharge temperature: healthier = cooler
     mapped_disT = DATASET_RANGES["disT"]["old"] - health * (DATASET_RANGES["disT"]["old"] - DATASET_RANGES["disT"]["new"])
     if 15 <= dis_temp <= 50:
         mapped_disT = np.clip(0.5 * mapped_disT + 0.5 * dis_temp,
@@ -257,27 +239,20 @@ def map_arduino_to_dataset(cycle_count, ch_current, ch_voltage, ch_temp,
     return mapped_cycle, mapped_chI, mapped_chV, mapped_chT, mapped_disI, mapped_disV, mapped_disT
 
 def build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
-    """Build the 15-feature array: 7 base (mapped) + 8 health indicators → scale"""
-    # Map Arduino values to dataset ranges (voltage-driven)
+    """Build the 8-feature array: [cycle, chI, chV, chT, disI, disV, disT, IR]"""
+    # Map Arduino values to dataset ranges
     m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT = map_arduino_to_dataset(
         cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp
     )
     
-    # Compute health indicators (same as train_models.py Phase 2)
-    voltage_rise = m_chV - m_disV
-    temp_diff = m_disT - m_chT
-    peak_temp = max(m_chT, m_disT)
-    discharge_capacity = m_disI * m_disV
-    charge_energy = m_chI * m_chV
-    efficiency = discharge_capacity / charge_energy if charge_energy > 0 else 1.0
-    current_ratio = m_disI / m_chI if m_chI > 0 else 1.0
-    temp_stress = m_disT * m_disI
+    # Compute Internal Resistance (IR) proxy - physics feature
+    # IR = (Avg Charge V - Avg Discharge V) / (Avg Charge I + Avg Discharge I)
+    # Using mapped values ensures consistency with training data range
+    ir_val = (m_chV - m_disV) / (m_chI + m_disI)
     
-    # 15 features in order matching training
+    # 8 features in order matching training: cycle, chI, chV, chT, disI, disV, disT, IR
     raw = np.array([[
-        m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT,
-        voltage_rise, temp_diff, peak_temp, discharge_capacity,
-        charge_energy, efficiency, current_ratio, temp_stress
+        m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT, ir_val
     ]])
     
     if feature_scaler is not None:
@@ -285,18 +260,19 @@ def build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_volt
     return raw
 
 def predict_soh_ml(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
-    """Predict SOH — primarily driven by battery voltage"""
+    """Predict SOH using model (Ridge/RF)"""
     if soh_model is None:
         return predict_soh_fallback(max(ch_voltage, dis_voltage), cycle, ch_temp)
     try:
         features = build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp)
         prediction = soh_model.predict(features)[0]
+        # Prediction is SOH % (0-100)
         return float(max(0, min(100, prediction)))
     except Exception as e:
         return predict_soh_fallback(max(ch_voltage, dis_voltage), cycle, ch_temp)
 
 def predict_rul_ml(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
-    """Predict RUL — remaining cycles until voltage drops below 3.0V"""
+    """Predict RUL (cycles to 80% SOH)"""
     if rul_model is None:
         return predict_rul_fallback(max(ch_voltage, dis_voltage), cycle)
     try:
@@ -309,26 +285,23 @@ def predict_rul_ml(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_volt
         return predict_rul_fallback(max(ch_voltage, dis_voltage), cycle)
 
 def predict_bct_ml(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
-    """Predict Battery Capacity — higher = better condition"""
+    """Predict Battery Capacity (Ah) — based on 1.2Ah nominal"""
     if bct_model is None:
         return predict_bct_fallback(max(ch_voltage, dis_voltage))
     try:
         features = build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp)
-        prediction = bct_model.predict(features)[0]
-        return float(max(0, prediction))
+        # Prediction is capacity factor (0-1)
+        factor = float(max(0, bct_model.predict(features)[0]))
+        return factor * 1.2  # Convert to Ah (1200mAh)
     except Exception as e:
         return predict_bct_fallback(max(ch_voltage, dis_voltage))
 
 # ============== Fallback Predictions (voltage-based) ==============
 
 def predict_soh_fallback(voltage, cycle_count, temperature):
-    """Voltage-based SOH fallback — 4.2V=100%, 3.0V=0%"""
+    """Voltage-based SOH fallback — 3.88V=100%, 2.0V=0%"""
     health = max(0, min(1, (voltage - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)))
-    voltage_soh = health * 100
-    cycle_factor = max(0, 100 - (cycle_count * 0.4)) if cycle_count > 0 else 100
-    temp_factor = 100 if 15 <= temperature <= 35 else 90
-    soh = (voltage_soh * 0.6 + cycle_factor * 0.2 + temp_factor * 0.2)
-    return max(0, min(100, soh))
+    return health * 100.0
 
 def predict_rul_fallback(voltage, cycle_count):
     """Voltage-based RUL fallback"""
@@ -338,13 +311,12 @@ def predict_rul_fallback(voltage, cycle_count):
     return {"cycles": remaining_cycles, "months": months}
 
 def predict_bct_fallback(voltage):
-    """Voltage-based BCT fallback"""
+    """Voltage-based BCT fallback (Ah)"""
     health = max(0, min(1, (voltage - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)))
-    return 0.75 + health * 1.24  # Range: 0.75 (dead) to 1.99 (new)
+    return health * 1.2  # 0.0 to 1.2 Ah
 
 def calculate_eul(cycle_count, voltage=None):
-    """Calculate Estimated Used Life percentage.
-    If voltage is provided, use it as primary indicator."""
+    """Calculate Estimated Used Life percentage."""
     if voltage is not None and voltage > 0:
         health = max(0, min(1, (voltage - BATTERY_DEAD_VOLTAGE) / (BATTERY_FULL_VOLTAGE - BATTERY_DEAD_VOLTAGE)))
         return min(100, (1 - health) * 100)

@@ -215,12 +215,31 @@ def map_arduino_to_dataset(cycle, ch_current, ch_voltage, ch_temp, dis_current, 
     return mapped_cycle, mapped_chI, mapped_chV, mapped_chT, mapped_disI, mapped_disV, mapped_disT
 
 def build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp):
-    """Build the 7-feature array: map Arduino values → dataset ranges → scale"""
+    """Build the 15-feature array: 7 base (mapped) + 8 health indicators → scale"""
     # First map Arduino values to dataset ranges
     m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT = map_arduino_to_dataset(
         cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_voltage, dis_temp
     )
-    raw = np.array([[m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT]])
+    
+    # Compute health indicators (same as train_models.py Phase 2)
+    voltage_rise = m_chV - m_disV
+    temp_diff = m_disT - m_chT
+    peak_temp = max(m_chT, m_disT)
+    discharge_capacity = m_disI * m_disV
+    charge_energy = m_chI * m_chV
+    efficiency = discharge_capacity / charge_energy if charge_energy > 0 else 1.0
+    current_ratio = m_disI / m_chI if m_chI > 0 else 1.0
+    temp_stress = m_disT * m_disI
+    
+    # 15 features in order: [cycle, chI, chV, chT, disI, disV, disT,
+    #   voltage_rise, temp_diff, peak_temp, discharge_capacity,
+    #   charge_energy, efficiency, current_ratio, temp_stress]
+    raw = np.array([[
+        m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT,
+        voltage_rise, temp_diff, peak_temp, discharge_capacity,
+        charge_energy, efficiency, current_ratio, temp_stress
+    ]])
+    
     if feature_scaler is not None:
         return feature_scaler.transform(raw)
     return raw

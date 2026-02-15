@@ -153,13 +153,18 @@ print(f"  RUL range: {df['RUL'].min()} - {df['RUL'].max()} cycles")
 # Capacity Factor (normalized 0-1)
 df['Capacity_Factor'] = df['BCt'] / NOMINAL_CAPACITY_DATASET
 
+# Coulomb throughput: cumulative charge passed (Cavus et al. 2025)
+# Approximation: charging current × cycle (proportional to accumulated Ah throughput)
+df['coulomb_throughput'] = df['chI'] * df['cycle']
+
 # =================== PHASE 4: MODEL TRAINING ===================
 print("\n--- Phase 4: Training ML Models ---")
 
-# Features: cycle data + polynomial + IR + exponential residual + temp
+# Features: cycle data + polynomial + IR + exponential residual + temp + coulomb
 features = [
     'cycle', 'chI', 'chV', 'chT', 'disI', 'disV', 'disT',  # 7 base
-    'IR', 'sqrt_cycle', 'cycle_sq', 'cap_residual', 'temp_diff'  # 5 paper-inspired
+    'IR', 'sqrt_cycle', 'cycle_sq', 'cap_residual', 'temp_diff',  # 5 paper-inspired
+    'coulomb_throughput'  # Cavus et al. 2025 — Coulomb counting proxy
 ]
 targets = ['SOH', 'RUL', 'Capacity_Factor']
 

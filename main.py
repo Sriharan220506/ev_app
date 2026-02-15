@@ -279,11 +279,14 @@ def build_features(cycle, ch_current, ch_voltage, ch_temp, dis_current, dis_volt
     # Temperature stress indicator
     temp_diff = m_disT - m_chT
     
-    # 12 features matching training order:
-    # cycle, chI, chV, chT, disI, disV, disT, IR, sqrt_cycle, cycle_sq, cap_residual, temp_diff
+    # Coulomb throughput: cumulative charge passed (Cavus et al. 2025)
+    coulomb_throughput = m_chI * m_cycle
+    
+    # 13 features matching training order:
+    # cycle, chI, chV, chT, disI, disV, disT, IR, sqrt_cycle, cycle_sq, cap_residual, temp_diff, coulomb_throughput
     raw = np.array([[
         m_cycle, m_chI, m_chV, m_chT, m_disI, m_disV, m_disT,
-        ir_val, sqrt_cycle, cycle_sq, cap_residual, temp_diff
+        ir_val, sqrt_cycle, cycle_sq, cap_residual, temp_diff, coulomb_throughput
     ]])
     
     if feature_scaler is not None:

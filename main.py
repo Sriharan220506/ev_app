@@ -589,15 +589,26 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
 
 @app.get("/api/telemetry/{vehicle_id}")
 def get_telemetry(vehicle_id: str, db: Session = Depends(get_db)):
-    """Get latest telemetry for a vehicle"""
+    """Get latest telemetry for a vehicle.
+    If the vehicle has no data yet (e.g. user just switched batteries),
+    fall back to vehicle-001 data (the Arduino's source) so the dashboard shows live readings."""
     
     telemetry = db.query(Telemetry)\
         .filter(Telemetry.vehicle_id == vehicle_id)\
         .order_by(desc(Telemetry.timestamp))\
         .first()
     
+    # Fallback: if this battery has no data yet, use vehicle-001 (Arduino source)
+    fallback_used = False
+    if not telemetry and vehicle_id != "vehicle-001":
+        telemetry = db.query(Telemetry)\
+            .filter(Telemetry.vehicle_id == "vehicle-001")\
+            .order_by(desc(Telemetry.timestamp))\
+            .first()
+        fallback_used = True
+    
     if not telemetry:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
+        raise HTTPException(status_code=404, detail="No telemetry data available")
     
     # Detect battery condition (rule-based)
     battery_condition = detect_battery_condition(
@@ -614,7 +625,7 @@ def get_telemetry(vehicle_id: str, db: Session = Depends(get_db)):
     )
     
     return {
-        "vehicleId": telemetry.vehicle_id,
+        "vehicleId": vehicle_id,  # Always return the requested battery ID
         "voltage": telemetry.voltage,
         "current": telemetry.current,
         "temperature": telemetry.temperature,
@@ -634,7 +645,8 @@ def get_telemetry(vehicle_id: str, db: Session = Depends(get_db)):
         "dischargingPower": telemetry.discharging_power,
         "batteryCondition": battery_condition,
         "bct": round(bct, 4),
-        "timestamp": telemetry.timestamp.isoformat()
+        "timestamp": telemetry.timestamp.isoformat(),
+        "fallback": fallback_used  # True if showing vehicle-001 data temporarily
     }
 
 @app.get("/api/telemetry/{vehicle_id}/history")
@@ -679,6 +691,13 @@ def get_soh_prediction(vehicle_id: str, db: Session = Depends(get_db)):
         .order_by(desc(Prediction.timestamp))\
         .first()
     
+    # Fallback to vehicle-001 if no predictions for this battery yet
+    if not prediction and vehicle_id != "vehicle-001":
+        prediction = db.query(Prediction)\
+            .filter(Prediction.vehicle_id == "vehicle-001")\
+            .order_by(desc(Prediction.timestamp))\
+            .first()
+    
     if not prediction:
         raise HTTPException(status_code=404, detail="No predictions available")
     
@@ -698,6 +717,12 @@ def get_rul_prediction(vehicle_id: str, db: Session = Depends(get_db)):
         .filter(Prediction.vehicle_id == vehicle_id)\
         .order_by(desc(Prediction.timestamp))\
         .first()
+    
+    if not prediction and vehicle_id != "vehicle-001":
+        prediction = db.query(Prediction)\
+            .filter(Prediction.vehicle_id == "vehicle-001")\
+            .order_by(desc(Prediction.timestamp))\
+            .first()
     
     if not prediction:
         raise HTTPException(status_code=404, detail="No predictions available")
@@ -720,6 +745,12 @@ def get_eul_prediction(vehicle_id: str, db: Session = Depends(get_db)):
         .order_by(desc(Prediction.timestamp))\
         .first()
     
+    if not prediction and vehicle_id != "vehicle-001":
+        prediction = db.query(Prediction)\
+            .filter(Prediction.vehicle_id == "vehicle-001")\
+            .order_by(desc(Prediction.timestamp))\
+            .first()
+    
     if not prediction:
         raise HTTPException(status_code=404, detail="No predictions available")
     
@@ -738,6 +769,12 @@ def get_all_predictions(vehicle_id: str, db: Session = Depends(get_db)):
         .filter(Prediction.vehicle_id == vehicle_id)\
         .order_by(desc(Prediction.timestamp))\
         .first()
+    
+    if not prediction and vehicle_id != "vehicle-001":
+        prediction = db.query(Prediction)\
+            .filter(Prediction.vehicle_id == "vehicle-001")\
+            .order_by(desc(Prediction.timestamp))\
+            .first()
     
     if not prediction:
         raise HTTPException(status_code=404, detail="No predictions available")
@@ -772,14 +809,27 @@ def get_health_metrics(vehicle_id: str, db: Session = Depends(get_db)):
         .order_by(desc(Telemetry.timestamp))\
         .first()
     
+    # Fallback to vehicle-001 if no telemetry for this battery yet
+    if not telemetry and vehicle_id != "vehicle-001":
+        telemetry = db.query(Telemetry)\
+            .filter(Telemetry.vehicle_id == "vehicle-001")\
+            .order_by(desc(Telemetry.timestamp))\
+            .first()
+    
     if not telemetry:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     
-    # Get latest ML prediction for SOH-based health
+    # Get latest ML prediction for SOH-based health (also with fallback)
     prediction = db.query(Prediction)\
         .filter(Prediction.vehicle_id == vehicle_id)\
         .order_by(desc(Prediction.timestamp))\
         .first()
+    
+    if not prediction and vehicle_id != "vehicle-001":
+        prediction = db.query(Prediction)\
+            .filter(Prediction.vehicle_id == "vehicle-001")\
+            .order_by(desc(Prediction.timestamp))\
+            .first()
     
     # Calculate health scores
     soc_health = 100 if 20 <= telemetry.soc <= 80 else 80

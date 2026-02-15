@@ -35,6 +35,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============== Active Battery Mapping ==============
+# Maps Arduino's vehicleId to the battery the user selected in the UI.
+# When Arduino sends as "vehicle-001", data is stored under the mapped target.
+# e.g. {"vehicle-001": "vehicle-002"} means data goes to Battery 2
+active_battery_map = {}
+
 # ============== Load ML Models ==============
 # Research paper-based models (Patrizi et al., 2024)
 # 12 features: cycle, chI, chV, chT, disI, disV, disT, IR, sqrt_cycle, cycle_sq, cap_residual, temp_diff
@@ -449,23 +455,49 @@ def health_check():
 async def startup():
     init_db()
 
+# ---------- Active Battery Mapping Endpoints ----------
+
+class ActiveBatteryRequest(BaseModel):
+    sourceId: str = "vehicle-001"  # Arduino's vehicleId
+    targetId: str                   # Battery to store data under
+
+@app.get("/api/active-battery")
+def get_active_battery():
+    """Get current battery mapping"""
+    return {"mapping": active_battery_map, "info": "Arduino data is routed to the mapped target battery"}
+
+@app.post("/api/active-battery")
+def set_active_battery(req: ActiveBatteryRequest):
+    """Set which battery the Arduino's data should be stored under.
+    e.g. sourceId=vehicle-001, targetId=vehicle-002 means Arduino data → Battery 2"""
+    active_battery_map[req.sourceId] = req.targetId
+    return {
+        "status": "ok",
+        "message": f"Data from {req.sourceId} will now be stored under {req.targetId}",
+        "mapping": active_battery_map
+    }
+
 # ---------- Telemetry Endpoints ----------
 
 @app.post("/api/telemetry")
 def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
-    """Receive telemetry from ESP32/Arduino and run ML predictions"""
+    """Receive telemetry from ESP32/Arduino and run ML predictions.
+    If active_battery_map has a mapping for this vehicleId, reroute data to the mapped battery."""
+    
+    # Reroute to active battery if mapping exists
+    target_id = active_battery_map.get(data.vehicleId, data.vehicleId)
     
     # Check if vehicle exists, create if not
-    vehicle = db.query(Vehicle).filter(Vehicle.id == data.vehicleId).first()
+    vehicle = db.query(Vehicle).filter(Vehicle.id == target_id).first()
     if not vehicle:
-        vehicle = Vehicle(id=data.vehicleId, name=f"Vehicle {data.vehicleId}")
+        vehicle = Vehicle(id=target_id, name=f"Vehicle {target_id}")
         db.add(vehicle)
     
     # --- Server-side Cycle Counting ---
     # A cycle = full discharge then full charge.
     # Detect transition: previous record was DISCHARGING, now CHARGING.
     prev = db.query(Telemetry)\
-        .filter(Telemetry.vehicle_id == data.vehicleId)\
+        .filter(Telemetry.vehicle_id == target_id)\
         .order_by(desc(Telemetry.timestamp))\
         .first()
     
@@ -481,9 +513,9 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
     primary_v = max(data.voltage, data.chargingVoltage, data.dischargingVoltage)
     computed_soc = calculate_soc_from_voltage(primary_v)
     
-    # Create telemetry record (use server-computed values)
+    # Create telemetry record (use server-computed values, stored under target battery)
     telemetry = Telemetry(
-        vehicle_id=data.vehicleId,
+        vehicle_id=target_id,
         voltage=data.voltage,
         current=data.current,
         temperature=data.temperature,
@@ -531,7 +563,7 @@ def receive_telemetry(data: TelemetryCreate, db: Session = Depends(get_db)):
     confidence = 0.95 if soh_model else 0.70
     
     prediction = Prediction(
-        vehicle_id=data.vehicleId,
+        vehicle_id=target_id,
         soh=soh,
         rul_cycles=rul["cycles"],
         rul_months=rul["months"],
